@@ -110,3 +110,53 @@ def test_build_metadata_uses_source_threshold(saved_baseline):
     meta = build_metadata(src, "fp16", "iOS17", {"mlpackage": 1, "tokenizer": 1, "metadata": 1})
     assert meta["threshold"] == src.metadata["threshold"]
     assert meta["minimum_deployment_target"] == "iOS17"
+
+
+@pytest.mark.parametrize("compression", ["palettize4", "int8"])
+def test_compressed_export_keeps_contract_and_records_method(saved_baseline, tmp_path, compression):
+    plain, small = tmp_path / "plain", tmp_path / compression
+    export_coreml(saved_baseline, plain, "fp16")
+    export_coreml(saved_baseline, small, "fp16", compression=compression)
+
+    spec = parity.load_mlmodel(small / "veto.mlpackage", "CPU_ONLY").get_spec()
+    assert [i.name for i in spec.description.input] == list(INPUT_NAMES)
+    assert [o.name for o in spec.description.output] == [OUTPUT_NAME]
+    for i in spec.description.input:
+        assert list(i.type.multiArrayType.shape) == [1, SEQ]
+
+    meta = json.loads((small / "metadata.json").read_text())
+    assert meta["precision"] == compression and meta["compute_precision"] == "fp16"
+    assert meta["compression"]["method"] in ("palettize_weights", "linear_quantize_weights")
+    assert meta["compression"]["nbits"] == (4 if compression == "palettize4" else 8)
+    assert 0.0 < meta["threshold"] < 1.0
+    assert meta["input_dtype"] == "int32" and meta["max_sequence_length"] == SEQ
+    assert json.loads((plain / "metadata.json").read_text())["compression"] == {"method": "none"}
+
+    ml = parity.load_mlmodel(small / "veto.mlpackage", "CPU_ONLY")
+    p = parity.coreml_probabilities(ml, tokmod.load_tokenizer(small / "tokenizer"), TEXTS, SEQ)
+    assert ((p >= 0) & (p <= 1)).all()
+
+
+def test_unknown_compression_is_rejected(saved_baseline, tmp_path):
+    with pytest.raises(ValueError, match="compression"):
+        export_coreml(saved_baseline, tmp_path / "x", "fp16", compression="palettize3")
+
+
+def test_generated_bundle_fits_the_extension_budget():
+    """If a local ``dist/coreml`` bundle exists and is compressed, it must stay under budget.
+
+    The Message Filter extension is killed at 24 MB, so the model file has a hard ceiling.
+    """
+    from pathlib import Path
+
+    meta_path = Path("dist/coreml/metadata.json")
+    if not meta_path.exists():
+        pytest.skip("no local dist/coreml bundle")
+    meta = json.loads(meta_path.read_text())
+    if meta.get("compression", {}).get("method", "none") == "none":
+        pytest.skip("local bundle is the uncompressed FP16 reference")
+    assert meta["artifact_sizes_bytes"]["mlpackage"] <= 12_000_000
+    assert 0.0 < meta["threshold"] < 1.0
+    assert meta["input_names"] == list(INPUT_NAMES) and meta["output_names"] == [OUTPUT_NAME]
+    assert meta["input_dtype"] == "int32"
+    assert meta["input_shapes"] == {n: [1, meta["max_sequence_length"]] for n in INPUT_NAMES}

@@ -20,6 +20,8 @@ POSITIVE_LABEL = "political_solicitation"
 NEGATIVE_LABEL = "not_political_solicitation"
 DEFAULT_TARGET = "iOS17"
 PRECISIONS = ("fp16", "fp32")
+#: Post-conversion weight compression. ``none`` keeps the plain FP16/FP32 export (the reference).
+COMPRESSIONS = ("none", "int8", "palettize4", "palettize6")
 
 
 def _import_ct():
@@ -58,6 +60,42 @@ def convert_wrapper(wrapper, precision: str = "fp16", target: str = DEFAULT_TARG
     )
 
 
+def compress_mlmodel(mlmodel, compression: str):
+    """Apply weight compression to a converted ML Program.
+
+    ``palettizeN`` replaces every weight tensor with an N-bit k-means lookup table (the large
+    embedding table benefits most); ``int8`` is symmetric linear quantization. Activations stay
+    FP16, and input/output names, shapes and dtypes are untouched.
+    """
+    if compression == "none":
+        return mlmodel
+    if compression not in COMPRESSIONS:
+        raise ValueError(f"compression must be one of {COMPRESSIONS}")
+    _import_ct()
+    import coremltools.optimize.coreml as cto
+
+    if compression == "int8":
+        config = cto.OptimizationConfig(global_config=cto.OpLinearQuantizerConfig(
+            mode="linear_symmetric", weight_threshold=512))
+        return cto.linear_quantize_weights(mlmodel, config)
+    nbits = int(compression.removeprefix("palettize"))
+    config = cto.OptimizationConfig(global_config=cto.OpPalettizerConfig(
+        mode="kmeans", nbits=nbits))
+    return cto.palettize_weights(mlmodel, config)
+
+
+def compression_info(compression: str) -> dict:
+    """The ``compression`` block recorded in ``metadata.json``."""
+    if compression == "none":
+        return {"method": "none"}
+    if compression == "int8":
+        return {"method": "linear_quantize_weights", "mode": "linear_symmetric", "nbits": 8,
+                "scope": "all weight tensors with at least 512 elements"}
+    return {"method": "palettize_weights", "mode": "kmeans",
+            "nbits": int(compression.removeprefix("palettize")), "granularity": "per_tensor",
+            "scope": "all weight tensors"}
+
+
 def dir_size(path: Path) -> int:
     path = Path(path)
     if path.is_file():
@@ -75,7 +113,8 @@ def library_versions() -> dict:
             "python_version": platform.python_version()}
 
 
-def build_metadata(src: SourceModel, precision: str, target: str, sizes: dict) -> dict:
+def build_metadata(src: SourceModel, precision: str, target: str, sizes: dict,
+                   compression: str = "none") -> dict:
     """Describe the artifact. Every value comes from the source model or the export itself."""
     meta = src.metadata
     seq = src.wrapper.seq_len
@@ -89,7 +128,9 @@ def build_metadata(src: SourceModel, precision: str, target: str, sizes: dict) -
                        else "fine-tuned MiniLM sequence classifier (pooler + 2-class head)"),
         "source_approach": meta.get("approach"),
         "coreml_format": "mlprogram",
-        "precision": precision,
+        "precision": precision if compression == "none" else compression,
+        "compute_precision": precision,
+        "compression": compression_info(compression),
         "minimum_deployment_target": target,
         "compute_note": "Fixed input shape; Core ML chooses CPU/GPU/Neural Engine at runtime.",
         "threshold": meta["threshold"],
@@ -117,7 +158,7 @@ def build_metadata(src: SourceModel, precision: str, target: str, sizes: dict) -
 
 
 def export_coreml(model_dir: Path, output: Path, precision: str = "fp16",
-                  target: str = DEFAULT_TARGET) -> dict:
+                  target: str = DEFAULT_TARGET, compression: str = "none") -> dict:
     """Export the saved Veto model to ``output`` and return a summary.
 
     Writes ``veto.mlpackage``, ``tokenizer/`` and ``metadata.json``; an existing ``output`` is
@@ -125,7 +166,7 @@ def export_coreml(model_dir: Path, output: Path, precision: str = "fp16",
     """
     output = Path(output)
     src = load_source_model(model_dir)
-    mlmodel = convert_wrapper(src.wrapper, precision, target)
+    mlmodel = compress_mlmodel(convert_wrapper(src.wrapper, precision, target), compression)
 
     if output.exists():
         shutil.rmtree(output)
@@ -139,7 +180,7 @@ def export_coreml(model_dir: Path, output: Path, precision: str = "fp16",
 
     sizes = {"mlpackage": dir_size(pkg), "tokenizer": dir_size(output / "tokenizer")}
     sizes["metadata"] = 0  # filled in after writing
-    meta = build_metadata(src, precision, target, sizes)
+    meta = build_metadata(src, precision, target, sizes, compression)
     meta_path = output / "metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2))
     sizes["metadata"] = meta_path.stat().st_size

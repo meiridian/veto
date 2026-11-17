@@ -50,6 +50,10 @@ def main(argv: list[str] | None = None) -> None:
     cm.add_argument("--model-dir", type=Path, default=Path("models/veto"))
     cm.add_argument("--output", type=Path, default=Path("dist/coreml"))
     cm.add_argument("--precision", choices=("fp16", "fp32"), default="fp16")
+    cm.add_argument("--compression", choices=("none", "int8", "palettize4", "palettize6"),
+                    default="none",
+                    help="weight compression (needed to fit the 24 MB Message Filter extension "
+                         "limit; re-derives the threshold from validation scores)")
     cm.add_argument("--deployment-target", choices=("iOS16", "iOS17", "iOS18"), default="iOS17")
     cm.add_argument("--no-verify", action="store_true", help="skip the Python/Core ML parity check")
     cm.add_argument("--local-sample", type=int, default=None,
