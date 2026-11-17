@@ -169,8 +169,13 @@ The selected model can be exported as a single, self-describing Core ML artifact
 
 ```bash
 uv sync --extra coreml            # once (macOS)
-uv run veto export coreml         # -> dist/coreml/{veto.mlpackage, metadata.json, tokenizer/}
+uv run veto export coreml --compression palettize4   # -> dist/coreml/{veto.mlpackage, metadata.json, tokenizer/}
 ```
+
+The iOS Message Filter extension is killed above 24 MB of memory, so the plain 45 MB FP16 model
+does not fit; `--compression` shrinks it (and re-derives the threshold from validation scores).
+See [docs/coreml_export.md](docs/coreml_export.md#compression-for-the-message-filter-extension)
+for the measured quality trade-offs.
 
 | | |
 |---|---|
@@ -178,7 +183,7 @@ uv run veto export coreml         # -> dist/coreml/{veto.mlpackage, metadata.jso
 | Inputs | `input_ids`, `attention_mask` (int32, `[1, 256]`) |
 | Output | `political_solicitation_probability` |
 | Threshold | in `metadata.json`, applied by the app (not in the graph) |
-| Size | about 46 MB including tokenizer assets |
+| Size | about 46 MB plain FP16; **12.4 MB with `--compression palettize4`** (needed for the 24 MB iOS Message Filter extension limit) |
 | Validation | zero decision disagreements on the committed test strings |
 
 The export is verified against Python inference. See [docs/coreml_export.md](docs/coreml_export.md)

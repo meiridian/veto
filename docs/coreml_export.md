@@ -110,8 +110,10 @@ The decision threshold is **not** part of the graph. It lives in `metadata.json`
 should_filter = political_solicitation_probability >= metadata.threshold
 ```
 
-The current value is 0.8700 (chosen on the validation set for high precision). Changing the
-threshold does not require re-exporting the model.
+The threshold is chosen on the validation set (maximum recall subject to precision >= 0.95). For
+the plain FP16 export it is 0.8700; for a compressed export it is **re-derived** from the
+compressed model's own validation scores (see "Compression" below), because compression shifts
+probabilities. Changing the threshold does not require re-exporting the model.
 
 ```text
 String
@@ -135,18 +137,98 @@ tokenizer (see contract above)
     should_filter
 ```
 
-**Heads-up on the current threshold.** Veto's threshold selection places the threshold exactly at
-one validation positive's own score (a tie of zero margin). Any reduced-precision runtime can
-flip that single message. A small safety margin in `select_threshold` (for example, the midpoint
-between neighboring scores) would remove the edge case. That is a training-side change and is not
-made here.
+**Heads-up on the FP16 threshold.** Veto's training-time threshold selection places the threshold
+exactly at one validation positive's own score (a tie of zero margin). Any reduced-precision
+runtime can flip that single message. The training-side rule is unchanged, but the compressed
+export applies a safety margin: the threshold moves to the midpoint between that score and the
+next lower validation score, which gives identical validation decisions with the largest margin.
+The plain FP16 export still carries the zero-margin threshold.
 
 ## Precision and deployment target
 
 - Format: Core ML **ML Program** (`mlprogram`), **FP16** compute precision.
 - Minimum deployment target: **iOS 17** (default; `--deployment-target iOS16|iOS17|iOS18`).
-- No quantization or palettization was applied. FP16 comes to 45.2 MB, and weight compression was
-  intentionally not explored until parity was established (see Limitations).
+- The plain export applies no quantization or palettization: FP16 comes to 45.2 MB. That is too
+  large for the Message Filter extension; see "Compression" below.
+
+## Compression (for the Message Filter extension)
+
+**Why.** iOS kills a Message Filter extension that exceeds a **24 MB** memory limit. On a real
+iPhone 14 the FP16 model (about 45 MB, memory-mapped) produced:
+
+```text
+memorystatus: VetoMessageFilter exceeded mem limit: ActiveHard 24 MB (fatal)
+Process VetoMessageFilter killed by jetsam reason per-process-limit
+```
+
+The extension died shortly after starting, so every message passed through unfiltered. The model
+needs to be much smaller.
+
+**How.** `--compression {none,int8,palettize4,palettize6}` applies coremltools weight compression
+(`coremltools.optimize.coreml`) to the converted FP16 model. Only the weights change:
+input/output names, shapes, dtypes and the tokenizer are identical, so the iOS side needs no
+code change. `metadata.json` records the method (`precision` becomes e.g. `palettize4`,
+`compute_precision` stays `fp16`, and a `compression` block gives method, mode and bits).
+
+```bash
+uv run veto export coreml --compression palettize4 --benchmark
+```
+
+Compression needs the private labeled corpus: the export compares the compressed model with the
+FP16 export on the full validation set, re-derives the threshold from the compressed model's
+validation scores (rule: max recall subject to precision >= 0.95, then moved to the midpoint of
+the gap to the next lower validation score), and writes the new threshold to `metadata.json`
+(`threshold_fp16_reference` keeps the old one).
+
+### Measured on v1 (M2 Pro; validation and test each hold 1,807 messages, 24 positives)
+
+| variant | model file | validation precision / recall / PR-AUC | held-out test precision / recall / PR-AUC | threshold | fixture decision flips (of 70) |
+|---|---|---|---|---|---|
+| FP16 (reference) | 45.2 MB | 1.000 / 1.000 / 1.000 | 1.000 / 0.792 / 0.949 | 0.8700 | 0 |
+| **palettize4 (4-bit)** | **11.4 MB** | 0.960 / 1.000 / 0.997 | 0.852 / 0.958 / 0.966 | 0.6770 | 6 |
+| palettize6 (6-bit) | 17.1 MB | 1.000 / 1.000 / 1.000 | 0.913 / 0.875 / 0.954 | 0.8245 | 1 |
+| int8 | 22.8 MB | 1.000 / 1.000 / 1.000 | 0.913 / 0.875 / 0.953 | 0.8303 | 1 |
+
+Each model is evaluated at its own threshold. Score deviation of 4-bit from FP16 on validation:
+max 0.337, mean 0.008, p95 0.034 (FP16 vs FP32 is max 0.004).
+
+**Choice: `palettize4`.** It is the only variant near the ~10 MB target (11.4 MB model, 12.4 MB
+with tokenizer assets); 6-bit and int8 are 17 and 23 MB, too close to the 24 MB limit once
+runtime memory is added. It passes the validation gates (precision 0.96 >= 0.95; recall equal to
+FP16). It does **not** meet every acceptance criterion cleanly, and these exceptions are
+deliberate and recorded in `metadata.json` (`validation.status = PASS_WITH_EXCEPTIONS`):
+
+- **Fixtures: 6 of 70 decisions differ** from the FP16/Python reference. Every flip is a message
+  the model scored between roughly 0.67 and 0.88, straddling the old and new thresholds, so the
+  parity fixtures (which deliberately include borderline messages) cannot agree on all decisions
+  once the threshold moves. The tolerance on the probability difference is therefore loose (0.5)
+  and "within precision noise" is vacuous for this variant; the decision-based gates above carry
+  the acceptance, not the fixture comparison.
+- **Held-out test precision is 0.852** (4 false positives, 1 false negative), below the 0.95
+  target that the threshold was tuned for on validation. FP16 at its threshold has no test false
+  positives but misses 5 of 24 positives (recall 0.792). The compressed model's test PR-AUC
+  (0.966) is not lower than FP16's (0.949), so ranking quality is intact; the operating point
+  moved to a lower threshold and trades precision for recall. With 24 positives per split, one
+  message is about 4 points of recall, so treat these numbers as rough.
+- The model file is 11.4 MB against a target of "about 10 MB".
+
+**Alternatives if this is not good enough:** `--compression palettize6` (17 MB, better held-out
+fidelity but little headroom); shrinking the embedding table by pruning the vocabulary to tokens
+seen in training, with an id remap inside the graph (keeps the iOS contract, but unseen tokens
+would map to `[UNK]`, a modeling change); or a smaller distilled encoder. None of these were done.
+Per-group 4-bit palettization was tried and rejected: it needs iOS 18 and produced a 29 MB model.
+
+### Memory and latency
+
+- File size is only a proxy for memory. `veto export coreml --benchmark` also loads the *compiled*
+  model CPU-only in a fresh process (as the extension does) and records growth in resident memory
+  and `phys_footprint` over a load plus 50 predictions.
+- **On macOS this probe does not discriminate between the variants**: peak RSS growth was about
+  34 MB for both FP16 and 4-bit, and `phys_footprint` growth was 5-6 MB for both, because Core ML
+  memory-maps weights. The macOS numbers do not reproduce the iPhone jetsam limit, so whether the
+  4-bit model fits in 24 MB has to be confirmed on a device.
+- CPU-only latency (median / p95): 5.34 / 5.87 ms for 4-bit against 5.61 / 6.32 ms for FP16;
+  2.20 ms median with all compute units. Mac measurements, not iPhone.
 
 ## How to run
 
@@ -162,6 +244,7 @@ Options:
 | `--model-dir` | `models/veto` | the trained model to export (the selected one) |
 | `--output` | `dist/coreml` | output directory (replaced if it exists) |
 | `--precision` | `fp16` | `fp16` or `fp32` |
+| `--compression` | `none` | `none`, `int8`, `palettize4` or `palettize6` (see Compression) |
 | `--deployment-target` | `iOS17` | `iOS16`, `iOS17` or `iOS18` |
 | `--no-verify` | off | skip the parity check |
 | `--local-sample N` | all | number of local validation/test messages to compare |
@@ -253,11 +336,12 @@ Swift tokenization speed will differ from the Python figure.
 ## Current limitations
 
 - **Not measured on an iPhone.** Latency, memory and Neural Engine behavior on device are untested.
-  A message-filter extension runs under tight memory limits that were not checked here; 46 MB of
-  model plus runtime memory should be measured on a real device before building on it.
-- **No weight compression.** FP16 was validated and kept. If device measurements show the size is
-  a problem, compressing the embedding table (for example, 8-bit palettization) is the obvious
-  experiment, and must be re-validated with this same parity suite.
+  The extension's 24 MB limit is the reason for compression (above); the macOS memory probe
+  cannot confirm that the compressed model fits, so check it on a device.
+- **The plain FP16 export (45 MB) does not fit the Message Filter extension.** Use a compressed
+  export for it.
+- **The compressed threshold is tuned on 24 validation positives**, so it is noisy; see the
+  held-out test numbers above.
 - **Fixed shape** `[1, 256]`: every message is padded to 256 tokens, so short messages cost the
   same as long ones. Enumerated sequence lengths are a possible later optimization.
 - **FP16 resolution near the threshold**: messages within about 0.004 of the threshold can change

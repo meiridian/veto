@@ -55,13 +55,19 @@ def coreml_probabilities(mlmodel, tokenizer, texts: list[str], seq_len: int) -> 
     return out
 
 
-def compare(py: np.ndarray, ml: np.ndarray, threshold: float) -> dict:
-    """Probability and decision agreement between two score arrays."""
+def compare(py: np.ndarray, ml: np.ndarray, threshold: float,
+            reference_threshold: float | None = None) -> dict:
+    """Probability and decision agreement between two score arrays.
+
+    ``reference_threshold`` is the threshold of the Python reference when it differs from the
+    Core ML model's (a compressed model gets its own re-derived threshold).
+    """
     diff = np.abs(py - ml)
-    py_flag, ml_flag = py >= threshold, ml >= threshold
+    ref_thr = threshold if reference_threshold is None else reference_threshold
+    py_flag, ml_flag = py >= ref_thr, ml >= threshold
     flipped = np.flatnonzero(py_flag != ml_flag)
     max_diff = float(diff.max()) if len(py) else 0.0
-    margins = [float(abs(py[i] - threshold)) for i in flipped]
+    margins = [float(abs(py[i] - ref_thr)) for i in flipped]
     return {
         "n": int(len(py)),
         "max_abs_diff": float(diff.max()) if len(py) else 0.0,
@@ -123,7 +129,8 @@ def error_counts(labels: np.ndarray, probs: np.ndarray, threshold: float) -> dic
 
 def run_parity(model_dir: Path, package: Path, tokenizer_dir: Path, seq_len: int,
                threshold: float, tolerance: float, *, local_labeled: Path | None = None,
-               local_n: int | None = None, compute_units: str = "ALL") -> dict:
+               local_n: int | None = None, compute_units: str = "ALL",
+               reference_threshold: float | None = None) -> dict:
     """Run the fixture, threshold-band and (optionally) local-corpus parity checks."""
     tok = tokmod.load_tokenizer(tokenizer_dir)
     ml = load_mlmodel(package, compute_units)
@@ -132,14 +139,15 @@ def run_parity(model_dir: Path, package: Path, tokenizer_dir: Path, seq_len: int
     texts = [f["text"] for f in fixtures]
     py = python_probabilities(model_dir, texts)
     cm = coreml_probabilities(ml, tok, texts, seq_len)
-    report: dict = {"compute_units": compute_units, "tolerance": tolerance, "threshold": threshold}
-    fx = compare(py, cm, threshold)
+    report: dict = {"compute_units": compute_units, "tolerance": tolerance, "threshold": threshold,
+                    "reference_threshold": reference_threshold or threshold}
+    fx = compare(py, cm, threshold, reference_threshold)
     cats = sorted({f["category"] for f in fixtures})
     fx["categories"] = cats
     fx["passes"] = fx["classification_disagreements"] == 0 and fx["max_abs_diff"] <= tolerance
     report["fixtures"] = fx
 
-    bands = threshold_band_texts(model_dir, threshold)
+    bands = threshold_band_texts(model_dir, reference_threshold or threshold)
     report["threshold_bands"] = {}
     for name, band_texts in bands.items():
         if not band_texts:
@@ -147,7 +155,7 @@ def run_parity(model_dir: Path, package: Path, tokenizer_dir: Path, seq_len: int
             continue
         bp = python_probabilities(model_dir, band_texts)
         bc = coreml_probabilities(ml, tok, band_texts, seq_len)
-        s = compare(bp, bc, threshold)
+        s = compare(bp, bc, threshold, reference_threshold)
         s["python_prob_range"] = [float(bp.min()), float(bp.max())]
         report["threshold_bands"][name] = s
 
@@ -155,8 +163,8 @@ def run_parity(model_dir: Path, package: Path, tokenizer_dir: Path, seq_len: int
         ltexts, labels = local_corpus_sample(local_labeled, local_n)
         lp = python_probabilities(model_dir, ltexts)
         lc = coreml_probabilities(ml, tok, ltexts, seq_len)
-        s = compare(lp, lc, threshold)
-        s["python_errors"] = error_counts(labels, lp, threshold)
+        s = compare(lp, lc, threshold, reference_threshold)
+        s["python_errors"] = error_counts(labels, lp, reference_threshold or threshold)
         s["coreml_errors"] = error_counts(labels, lc, threshold)
         report["local_corpus"] = s
     return report
