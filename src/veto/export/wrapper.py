@@ -115,6 +115,32 @@ def sha256_of(paths: list[Path]) -> str:
     return h.hexdigest()
 
 
+class VetoStaticCoreMLModel(nn.Module):
+    """Static-embedding model: remap ids -> table rows -> masked sum -> L2 norm -> logreg.
+
+    Same public interface as :class:`VetoCoreMLModel` (``[1, L]`` ids and mask in, one
+    probability out), so the iOS side does not change.
+    """
+
+    #: Only the table lookup runs in FP16; see ``coreml._compute_precision``.
+    fp16_ops = ("gather",)
+
+    def __init__(self, remap, table, coef, intercept: float, seq_len: int) -> None:
+        super().__init__()
+        self.seq_len = seq_len
+        self.register_buffer("remap", torch.as_tensor(remap, dtype=torch.long))
+        self.table = nn.Embedding.from_pretrained(torch.as_tensor(table, dtype=torch.float32))
+        self.classifier = nn.Linear(table.shape[1], 1)
+        self.classifier.weight.data = torch.as_tensor(coef, dtype=torch.float32).reshape(1, -1)
+        self.classifier.bias.data = torch.tensor([intercept], dtype=torch.float32)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        rows = self.table(self.remap[input_ids.long()])
+        x = (rows * attention_mask.unsqueeze(-1).to(rows.dtype)).sum(1)
+        x = F.normalize(x, p=2.0, dim=-1, eps=1e-6)
+        return torch.sigmoid(self.classifier(x)).reshape(1)
+
+
 def load_source_model(model_dir: Path, seq_len: int | None = None) -> SourceModel:
     """Load the model saved by ``veto train`` and build the export wrapper (eval mode)."""
     from transformers import AutoModel, AutoModelForSequenceClassification
@@ -124,6 +150,13 @@ def load_source_model(model_dir: Path, seq_len: int | None = None) -> SourceMode
     kind = metadata["model_type"]
     seq_len = seq_len or int(metadata["hyperparameters"]["max_length"])
 
+    if kind == "static":
+        from veto.training.static import StaticModel
+
+        path = model_dir / "model" / "static.npz"
+        m = StaticModel.load(path)
+        wrapper = VetoStaticCoreMLModel(m.remap, m.table, m.coef, m.intercept, seq_len).eval()
+        return SourceModel(wrapper, metadata, kind, model_dir / "tokenizer", [path])
     if kind == "baseline":
         import joblib
 

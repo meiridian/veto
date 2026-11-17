@@ -62,7 +62,8 @@ project's exported bundle.
   train, validation and test.
 - **Two approaches, compared.** A frozen-embedding logistic regression baseline against a
   fine-tuned `BertForSequenceClassification` head. The better one is selected and saved.
-- **Core ML export.** One FP16 ML Program (about 46 MB with tokenizer assets), verified against
+- **Core ML export.** A 3.3 MB static-embedding model for the iOS extension (or the full MiniLM
+  model), verified against
   Python inference.
 - **Runnable without your data.** A synthetic example dataset ships in the repo.
 
@@ -165,26 +166,30 @@ not a useful filter.
 
 ## Export to Core ML
 
-The selected model can be exported as a single, self-describing Core ML artifact for the iOS app:
+The selected model can be exported as a single, self-describing Core ML artifact for the iOS app.
+For the iOS **Message Filter extension**, export the small static-embedding model:
 
 ```bash
-uv sync --extra coreml            # once (macOS)
-uv run veto export coreml --compression palettize4   # -> dist/coreml/{veto.mlpackage, metadata.json, tokenizer/}
+uv sync --extra coreml                                   # once (macOS)
+uv run veto distill                                      # models/veto -> models/veto_static
+uv run veto export coreml --model-dir models/veto_static # -> dist/coreml/
 ```
 
-The iOS Message Filter extension is killed above 24 MB of memory, so the plain 45 MB FP16 model
-does not fit; `--compression` shrinks it (and re-derives the threshold from validation scores).
-See [docs/coreml_export.md](docs/coreml_export.md#compression-for-the-message-filter-extension)
-for the measured quality trade-offs.
+iOS kills the Message Filter extension above 24 MB of memory. On an iPhone, the MiniLM model
+exceeded that even with 4-bit weights, because Core ML expands the weights when it loads them.
+`veto distill` replaces the transformer with fixed token vectors distilled from MiniLM: a 3.3 MB
+model with no change to the iOS contract. See
+[docs/coreml_export.md](docs/coreml_export.md#static-embedding-model-for-the-message-filter-extension)
+for the design and the quality trade-offs.
 
 | | |
 |---|---|
-| Format | Core ML ML Program, FP16, iOS 17+ |
+| Format | Core ML ML Program, iOS 17+ |
 | Inputs | `input_ids`, `attention_mask` (int32, `[1, 256]`) |
 | Output | `political_solicitation_probability` |
 | Threshold | in `metadata.json`, applied by the app (not in the graph) |
-| Size | about 46 MB plain FP16; **12.4 MB with `--compression palettize4`** (needed for the 24 MB iOS Message Filter extension limit) |
-| Validation | zero decision disagreements on the committed test strings |
+| Size | **3.3 MB static model** (4.3 MB with tokenizer); MiniLM: 45 MB FP16, 11.4 MB 4-bit |
+| Validation | zero decision disagreements against Python on the committed test strings |
 
 The export is verified against Python inference. See [docs/coreml_export.md](docs/coreml_export.md)
 for the tokenizer contract, model interface, parity results and limitations. `dist/` is gitignored

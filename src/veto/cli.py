@@ -44,6 +44,14 @@ def main(argv: list[str] | None = None) -> None:
                       ("learning_rate", float)):
         d.add_argument(f"--{name.replace('_', '-')}", dest=name, type=typ, default=None)
 
+    ds = sub.add_parser("distill", help="distill the MiniLM baseline into a small static-embedding "
+                                       "model (fits the iOS Message Filter extension)")
+    ds.add_argument("--source", type=Path, default=Path("models/veto"))
+    ds.add_argument("--output", type=Path, default=Path("models/veto_static"))
+    ds.add_argument("--labeled", type=Path, default=Path("data/processed/labeled.parquet"))
+    ds.add_argument("--dims", type=int, default=256)
+    ds.add_argument("--C", type=float, default=10.0)
+
     ex = sub.add_parser("export", help="export the selected model for deployment")
     exsub = ex.add_subparsers(dest="target", required=True)
     cm = exsub.add_parser("coreml", help="export to Core ML (dist/coreml/)")
@@ -98,6 +106,20 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps({k: res[k] for k in ("selected", "selection_rule")}, indent=2))
         print(f"Results: {out}/artifacts/evaluation.json  Model: {out}/models/veto "
               f"(try: veto predict --model-dir {out}/models/veto \"...\")")
+    elif args.cmd == "distill":
+        from veto.training.static import StaticConfig, train_static
+
+        meta = train_static(args.source, args.labeled, args.output,
+                            StaticConfig(dims=args.dims, C=args.C))
+        hp = meta["hyperparameters"]
+        print(f"Saved {args.output}: {hp['kept_tokens']} tokens x {hp['dims']} dims, "
+              f"{meta['parameter_count']:,} parameters")
+        print(f"Threshold {meta['threshold']:.4f} (margin {meta['threshold_margin']:.4f})")
+        for split, c in meta["comparison_with_minilm_baseline"].items():
+            for name, m in c.items():
+                print(f"  {split:<10} {name:<16} precision={m['precision']:.3f} "
+                      f"recall={m['recall']:.3f} pr_auc={m['pr_auc']:.4f} "
+                      f"fp={m['false_positives']} fn={m['false_negatives']}")
     elif args.cmd == "export":
         from veto.export.cli import run_export_coreml
 

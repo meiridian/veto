@@ -56,3 +56,30 @@ def saved_finetuned(tmp_path):
     tiny_tokenizer(tmp_path).save_pretrained(d / "tokenizer")
     _write_meta(d, "finetuned")
     return d
+
+
+STATIC_TRAIN = ["vote early now", "donate now to the campaign", "chip in to the campaign",
+                "vote and donate", "hello friend", "dinner tonight lol", "you and me tonight",
+                "hello hello friend"]
+STATIC_LABELS = [1, 1, 1, 1, 0, 0, 0, 0]
+
+
+@pytest.fixture
+def saved_static(tmp_path):
+    """A saved static-embedding model dir built from random token vectors (no MiniLM)."""
+    from export_tiny import WORDS
+
+    from veto.export.tokenizer import encode_fixed
+    from veto.training.static import StaticConfig, fit_static, ignored_token_ids
+
+    d = tmp_path / "static"
+    tok = tiny_tokenizer(tmp_path)
+    vectors = np.random.default_rng(3).normal(size=(5 + len(WORDS), 16)).astype(np.float32)
+    ids, mask = encode_fixed(tok, STATIC_TRAIN, SEQ)
+    model = fit_static(vectors, ids, mask, np.array(STATIC_LABELS), StaticConfig(dims=6, C=1.0),
+                       ignored_token_ids(tok))
+    (d / "model").mkdir(parents=True)
+    model.save(d / "model" / "static.npz")
+    tok.save_pretrained(d / "tokenizer")
+    _write_meta(d, "static")
+    return d
