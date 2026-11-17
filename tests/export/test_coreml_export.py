@@ -153,10 +153,28 @@ def test_generated_bundle_fits_the_extension_budget():
     if not meta_path.exists():
         pytest.skip("no local dist/coreml bundle")
     meta = json.loads(meta_path.read_text())
-    if meta.get("compression", {}).get("method", "none") == "none":
-        pytest.skip("local bundle is the uncompressed FP16 reference")
-    assert meta["artifact_sizes_bytes"]["mlpackage"] <= 12_000_000
+    static = meta["model_type"].startswith("static")
+    if meta.get("compression", {}).get("method", "none") == "none" and not static:
+        pytest.skip("local bundle is the uncompressed MiniLM FP16 reference")
+    assert meta["artifact_sizes_bytes"]["mlpackage"] <= (5_000_000 if static else 12_000_000)
     assert 0.0 < meta["threshold"] < 1.0
     assert meta["input_names"] == list(INPUT_NAMES) and meta["output_names"] == [OUTPUT_NAME]
     assert meta["input_dtype"] == "int32"
     assert meta["input_shapes"] == {n: [1, meta["max_sequence_length"]] for n in INPUT_NAMES}
+
+
+def test_static_model_exports_with_same_contract_and_exact_parity(saved_static, tmp_path):
+    out = tmp_path / "static_export"
+    export_coreml(saved_static, out, "fp16")
+    spec = parity.load_mlmodel(out / "veto.mlpackage", "CPU_ONLY").get_spec()
+    assert [i.name for i in spec.description.input] == list(INPUT_NAMES)
+    assert [o.name for o in spec.description.output] == [OUTPUT_NAME]
+    for i in spec.description.input:
+        assert list(i.type.multiArrayType.shape) == [1, SEQ]
+    meta = json.loads((out / "metadata.json").read_text())
+    assert meta["model_type"].startswith("static token embeddings")
+    assert meta["compute_precision"] == "fp16 table lookup, fp32 arithmetic"
+    rep = parity.run_parity(saved_static, out / "veto.mlpackage", out / "tokenizer", SEQ,
+                            threshold=0.42, tolerance=1e-3, compute_units="CPU_ONLY")
+    assert rep["fixtures"]["classification_disagreements"] == 0
+    assert rep["fixtures"]["max_abs_diff"] < 1e-3

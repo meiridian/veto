@@ -153,6 +153,10 @@ The plain FP16 export still carries the zero-margin threshold.
 
 ## Compression (for the Message Filter extension)
 
+> **Superseded on a device.** The 4-bit export below was still killed at 24 MB on an iPhone 14.
+> Use the static-embedding model (next section) for the extension. Compression is kept as an
+> option for the full app.
+
 **Why.** iOS kills a Message Filter extension that exceeds a **24 MB** memory limit. On a real
 iPhone 14 the FP16 model (about 45 MB, memory-mapped) produced:
 
@@ -230,6 +234,87 @@ Per-group 4-bit palettization was tried and rejected: it needs iOS 18 and produc
 - CPU-only latency (median / p95): 5.34 / 5.87 ms for 4-bit against 5.61 / 6.32 ms for FP16;
   2.20 ms median with all compute units. Mac measurements, not iPhone.
 
+## Static-embedding model (for the Message Filter extension)
+
+**Why compression was not enough.** On an iPhone 14 (iOS 27.0.1) both MiniLM exports were killed
+inside the extension: the 45 MB FP16 model and the 11.4 MB 4-bit model. The extension's
+`phys_footprint` was 2.4 MB before loading, 11.2 MB while the weight file was mapped, and then it
+jumped past 24 MB in under a millisecond. In the full app (no limit), the 4-bit model on `cpuOnly`
+cost about 10 MB to load and 13.5 MB after the first prediction. The likely cause is that Core ML
+on the CPU expands compressed weights to 16-bit when loading them. That is not proven, but if it
+is right, any compressed MiniLM variant fails the same way. The macOS memory probe showed only
+about 5 MB, so **neither the Mac figure nor the file size shows whether a model fits.**
+
+**Design.** `veto distill` builds a model with no transformer:
+
+1. **Token vectors.** Every vocabulary token `t` gets MiniLM's mean-pooled output for
+   `[CLS] t [SEP]`, using the trained v1 encoder. The vectors are reduced to 256 dimensions with
+   PCA.
+2. **Vocabulary.** Only the 6,367 tokens that occur in the training split are kept. The pruning is
+   an id remap stored *inside the model*: a 30,522-entry table maps each token id to a row, and
+   unseen tokens and `[PAD]`/`[CLS]`/`[SEP]`/`[MASK]` map to an all-zero row, so they are ignored.
+3. **Message vector.** The sum of its token vectors (masked), L2-normalized. This equals the
+   normalized mean.
+4. **Classifier.** Logistic regression (`C = 10`, balanced classes), refit on the training split.
+
+**Contract.** Nothing changes for `veto-ios`:
+- Inputs, output, shapes and dtypes are identical.
+- The tokenizer assets are byte-for-byte identical to the MiniLM export (`vocab.txt`,
+  `tokenizer.json`, `tokenizer_config.json`, `golden_tokenization.json`).
+- Token ids are unchanged, because the remap happens in the graph.
+- Only the `threshold` value in `metadata.json` changes.
+
+**Size and precision.**
+- 1,630,465 parameters; the model file is 3.30 MB and the bundle 4.28 MB with the tokenizer.
+- The embedding table is stored in FP16 (rounded to FP16 at training time) and only the lookup runs
+  in FP16. The sum, normalization and classifier run in FP32 (`compute_precision`: "fp16 table
+  lookup, fp32 arithmetic"). With FP16 everywhere the parity error reached 0.026 and one fixture
+  flipped.
+- The weights are not palettized or quantized, so there is nothing for Core ML to expand.
+
+**How the configuration was chosen.** Variants (vocabulary, dimensions, token weighting, `C`)
+were compared on validation. The rule, fixed before looking at the test split, was: the smallest
+table with validation precision >= 0.95 and validation recall within 2 points of the MiniLM
+baseline. The test split was only reported. Other variants seen:
+- Full vocabulary, 128 dimensions with frequency (SIF) weighting: 7.8 MB, test recall 0.875, but
+  validation recall only 0.917.
+- Full vocabulary, 256 dimensions: 15.6 MB.
+
+**Threshold.** The same rule as before: maximum recall subject to validation precision >= 0.95,
+placed at the midpoint of the gap to the next lower validation score. The result is **0.8898**,
+with a margin of 0.0138.
+
+### Quality against the MiniLM baseline (each at its own threshold; 1,807 messages, 24 positives per split)
+
+| split | model | precision | recall | PR-AUC | FP | FN |
+|---|---|---|---|---|---|---|
+| validation | MiniLM baseline | 1.000 | 1.000 | 1.000 | 0 | 0 |
+| validation | **static** | 1.000 | 1.000 | 1.000 | 0 | 0 |
+| test (held-out) | MiniLM baseline | 1.000 | 0.792 | 0.951 | 0 | 5 |
+| test (held-out) | **static** | 1.000 | 0.708 | 0.958 | 0 | 7 |
+
+- On validation, the static model matches the baseline.
+- On the held-out test split it catches 2 fewer of the 24 positives (recall 0.708 against 0.792)
+  with no false positives. That is more than the 2-point target, and with 24 positives it is 2
+  messages.
+- PR-AUC is not lower, so ranking quality held; the threshold, tuned on validation, is
+  conservative on test.
+- The trade-off for size: tokens never seen in training are ignored, so new names and wording
+  contribute nothing until the model is retrained.
+
+### Parity and performance (M2 Pro)
+
+| comparison | n | max diff | disagreements |
+|---|---|---|---|
+| Fixtures, Core ML vs Python (ALL and CPU only) | 70 | 0.00024 | 0 |
+| Local corpus, Core ML vs Python | 3,614 | 0.00024 | 0 |
+| FP32 Core ML reference | 3,614 | < 1e-6 | 0 |
+
+- **Verdict:** PASS, with a tolerance of 0.01.
+- **CPU-only inference:** 0.065 ms median, or 0.20 ms including Python tokenization. On the Mac,
+  memory grew by 8 MB RSS and 3 MB footprint.
+- **iPhone footprint: not measured yet.** That needs the device test in `veto-ios`.
+
 ## How to run
 
 ```bash
@@ -244,6 +329,7 @@ Options:
 | `--model-dir` | `models/veto` | the trained model to export (the selected one) |
 | `--output` | `dist/coreml` | output directory (replaced if it exists) |
 | `--precision` | `fp16` | `fp16` or `fp32` |
+| `--model-dir models/veto_static` | | export the static model made by `veto distill` (for the extension) |
 | `--compression` | `none` | `none`, `int8`, `palettize4` or `palettize6` (see Compression) |
 | `--deployment-target` | `iOS17` | `iOS16`, `iOS17` or `iOS18` |
 | `--no-verify` | off | skip the parity check |
@@ -338,8 +424,8 @@ Swift tokenization speed will differ from the Python figure.
 - **Not measured on an iPhone.** Latency, memory and Neural Engine behavior on device are untested.
   The extension's 24 MB limit is the reason for compression (above); the macOS memory probe
   cannot confirm that the compressed model fits, so check it on a device.
-- **The plain FP16 export (45 MB) does not fit the Message Filter extension.** Use a compressed
-  export for it.
+- **MiniLM does not fit the Message Filter extension on a device**, not even 4-bit. Use the static
+  model (`veto distill`); its device footprint is still to be measured.
 - **The compressed threshold is tuned on 24 validation positives**, so it is noisy; see the
   held-out test numbers above.
 - **Fixed shape** `[1, 256]`: every message is padded to 256 tokens, so short messages cost the

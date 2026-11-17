@@ -37,6 +37,21 @@ def _import_ct():
     return ct
 
 
+def _compute_precision(ct, wrapper, precision: str):
+    """FP16 everywhere, unless the wrapper limits FP16 to some ops (``fp16_ops``).
+
+    The static model keeps its embedding table and lookup in FP16 (half the file size; the
+    table is already FP16-rounded at training time) and does the arithmetic in FP32, which
+    keeps it exact against Python.
+    """
+    if precision != "fp16":
+        return ct.precision.FLOAT32
+    ops = getattr(wrapper, "fp16_ops", None)
+    if ops is None:
+        return ct.precision.FLOAT16
+    return ct.transform.FP16ComputePrecision(op_selector=lambda op: op.op_type in ops)
+
+
 def convert_wrapper(wrapper, precision: str = "fp16", target: str = DEFAULT_TARGET):
     """Trace ``wrapper`` and convert it to a Core ML ML Program (fixed shape ``[1, L]``)."""
     import torch
@@ -55,7 +70,7 @@ def convert_wrapper(wrapper, precision: str = "fp16", target: str = DEFAULT_TARG
                 ct.TensorType(name=INPUT_NAMES[1], shape=(1, seq), dtype=np.int32)],
         outputs=[ct.TensorType(name=OUTPUT_NAME)],
         convert_to="mlprogram",
-        compute_precision=ct.precision.FLOAT16 if precision == "fp16" else ct.precision.FLOAT32,
+        compute_precision=_compute_precision(ct, wrapper, precision),
         minimum_deployment_target=getattr(ct.target, target),
     )
 
@@ -123,13 +138,18 @@ def build_metadata(src: SourceModel, precision: str, target: str, sizes: dict,
         "model_name": "veto",
         "model_version": meta.get("model_version", "unknown"),
         "base_model": meta["base_model"],
-        "model_type": ("MiniLM encoder + mean pooling + L2 norm + logistic regression"
-                       if kind == "baseline"
-                       else "fine-tuned MiniLM sequence classifier (pooler + 2-class head)"),
+        "model_type": {
+            "baseline": "MiniLM encoder + mean pooling + L2 norm + logistic regression",
+            "finetuned": "fine-tuned MiniLM sequence classifier (pooler + 2-class head)",
+            "static": "static token embeddings distilled from MiniLM (training-split vocabulary "
+                      "via an in-graph id remap) + sum + L2 norm + logistic regression",
+        }[kind],
         "source_approach": meta.get("approach"),
         "coreml_format": "mlprogram",
         "precision": precision if compression == "none" else compression,
-        "compute_precision": precision,
+        "compute_precision": (precision if not getattr(src.wrapper, "fp16_ops", None)
+                              or precision != "fp16"
+                              else "fp16 table lookup, fp32 arithmetic"),
         "compression": compression_info(compression),
         "minimum_deployment_target": target,
         "compute_note": "Fixed input shape; Core ML chooses CPU/GPU/Neural Engine at runtime.",

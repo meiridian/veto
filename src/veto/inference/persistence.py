@@ -52,4 +52,12 @@ def load_scorer(model_dir: Path, metadata: dict, device: str | None = None):
         enc = load_encoder(str(model_dir / "model" / "encoder"), device)
         clf = joblib.load(model_dir / "model" / "logreg.joblib")
         return lambda texts: clf.predict_proba(embed(list(texts), enc))[:, 1]
+    if kind == "static":
+        from veto.export.tokenizer import encode_fixed, load_tokenizer
+        from veto.training.static import StaticModel
+
+        model = StaticModel.load(model_dir / "model" / "static.npz")
+        tok = load_tokenizer(model_dir / "tokenizer")
+        seq_len = int(metadata["hyperparameters"]["max_length"])
+        return lambda texts: model.predict_proba(*encode_fixed(tok, list(texts), seq_len))
     raise ValueError(f"unknown model_type {kind!r}")
