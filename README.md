@@ -6,7 +6,7 @@
 
 **A privacy-first classifier for unsolicited political text messages. Train it and run it entirely on your own device.**
 
-[![CI](https://github.com/Carmeisel101/veto/actions/workflows/ci.yml/badge.svg)](https://github.com/Carmeisel101/veto/actions/workflows/ci.yml)
+[![CI](https://github.com/meiridian/veto/actions/workflows/ci.yml/badge.svg)](https://github.com/meiridian/veto/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Python 3.10–3.13](https://img.shields.io/badge/python-3.10%E2%80%933.13-blue)
 ![Status: early development](https://img.shields.io/badge/status-early%20development-yellow)
@@ -29,7 +29,7 @@ builds a corpus from your own messages, labels it, trains a small MiniLM-based c
 evaluates it, and exports it to [Core ML](https://developer.apple.com/documentation/coreml).
 
 The iOS runtime (Swift tokenizer, Core ML inference and a Message Filter Extension) lives in the
-separate [`veto-ios`](https://github.com/Carmeisel101/veto-ios) repository, which consumes this
+separate [`veto-ios`](https://github.com/meiridian/veto-ios) repository, which consumes this
 project's exported bundle.
 
 > **Status: early development.** Veto v1 is a first baseline, not a production filter. The
@@ -117,7 +117,7 @@ Veto uses [uv](https://docs.astral.sh/uv/). The project pins Python 3.12 (`.pyth
 because PyTorch does not yet publish wheels for the newest Python releases.
 
 ```bash
-git clone https://github.com/Carmeisel101/veto && cd veto
+git clone https://github.com/meiridian/veto && cd veto
 uv run pytest            # creates the environment on first run, then runs the tests
 ```
 
